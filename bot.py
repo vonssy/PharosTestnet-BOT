@@ -1230,7 +1230,7 @@ class PharosTestnet:
 
             return None
             
-    async def verify_task(self, address: str, tx_hash: str, proxy=None, retries=30):
+    async def verify_task(self, address: str, tx_hash: str, proxy_url=None, retries=30):
         url = f"{self.BASE_API}/task/verify"
         data = json.dumps({"address":address, "task_id":103, "tx_hash":tx_hash})
         headers = {
@@ -1244,7 +1244,7 @@ class PharosTestnet:
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.post(url=url, headers=headers, data=data, ssl=False) as response:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         result = await response.json()
                         if "code" in result and result["code"] != 0:

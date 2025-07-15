@@ -4,12 +4,12 @@ from eth_utils import to_hex
 from eth_abi.abi import encode
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from aiohttp import ClientResponseError, ClientSession, ClientTimeout
+from aiohttp import ClientResponseError, ClientSession, ClientTimeout, BasicAuth
 from aiohttp_socks import ProxyConnector
 from fake_useragent import FakeUserAgent
 from datetime import datetime, timezone
 from colorama import *
-import asyncio, random, secrets, json, time, os, pytz
+import asyncio, random, secrets, json, time, re, os, pytz
 
 wib = pytz.timezone('Asia/Jakarta')
 
@@ -133,7 +133,7 @@ class PharosTestnet:
         try:
             if use_proxy_choice == 1:
                 async with ClientSession(timeout=ClientTimeout(total=30)) as session:
-                    async with session.get("https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text") as response:
+                    async with session.get("https://raw.githubusercontent.com/monosans/proxy-list/refs/heads/main/proxies/http.txt") as response:
                         response.raise_for_status()
                         content = await response.text()
                         with open(filename, 'w') as f:
@@ -165,22 +165,42 @@ class PharosTestnet:
             return proxies
         return f"http://{proxies}"
 
-    def get_next_proxy_for_account(self, token):
-        if token not in self.account_proxies:
+    def get_next_proxy_for_account(self, account):
+        if account not in self.account_proxies:
             if not self.proxies:
                 return None
             proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
-            self.account_proxies[token] = proxy
+            self.account_proxies[account] = proxy
             self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
-        return self.account_proxies[token]
+        return self.account_proxies[account]
 
-    def rotate_proxy_for_account(self, token):
+    def rotate_proxy_for_account(self, account):
         if not self.proxies:
             return None
         proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
-        self.account_proxies[token] = proxy
+        self.account_proxies[account] = proxy
         self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
         return proxy
+
+    def build_proxy_config(self, proxy=None):
+        if not proxy:
+            return None, None, None
+
+        if proxy.startswith("socks"):
+            connector = ProxyConnector.from_url(proxy)
+            return connector, None, None
+
+        elif proxy.startswith("http"):
+            match = re.match(r"http://(.*?):(.*?)@(.*)", proxy)
+            if match:
+                username, password, host_port = match.groups()
+                clean_url = f"http://{host_port}"
+                auth = BasicAuth(username, password)
+                return None, clean_url, auth
+            else:
+                return None, proxy, None
+
+        raise Exception("Unsupported Proxy Type.")
     
     def generate_address(self, account: str):
         try:
@@ -351,35 +371,36 @@ class PharosTestnet:
             )
             return None
         
-    async def wait_for_receipt_with_retries(self, web3, tx_hash, retries=5):
-        for attempt in range(retries):
-            try:
-                receipt = await asyncio.to_thread(web3.eth.wait_for_transaction_receipt, tx_hash, timeout=300)
-                return receipt
-            except (Exception, TransactionNotFound) as e:
-                if attempt < retries:
-                    await asyncio.sleep(5)
-                    continue
-                raise Exception("Transaction Receipt Not Found.")
-            
     async def send_raw_transaction_with_retries(self, account, web3, tx, retries=5):
         for attempt in range(retries):
             try:
                 signed_tx = web3.eth.account.sign_transaction(tx, account)
                 raw_tx = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 tx_hash = web3.to_hex(raw_tx)
-
                 return tx_hash
-            except (Exception, TransactionNotFound) as e:
-                if attempt < retries:
-                    await asyncio.sleep(5)
-                    continue
-                raise Exception("Transaction Hash Not Found.")
-        
+            except TransactionNotFound:
+                pass
+            except Exception as e:
+                pass
+            await asyncio.sleep(2 ** attempt)
+        raise Exception("Transaction Hash Not Found After Maximum Retries")
+
+    async def wait_for_receipt_with_retries(self, web3, tx_hash, retries=5):
+        for attempt in range(retries):
+            try:
+                receipt = await asyncio.to_thread(web3.eth.wait_for_transaction_receipt, tx_hash, timeout=300)
+                return receipt
+            except TransactionNotFound:
+                pass
+            except Exception as e:
+                pass
+            await asyncio.sleep(2 ** attempt)
+        raise Exception("Transaction Receipt Not Found After Maximum Retries")
+
     async def perform_transfer(self, account: str, address: str, receiver: str, use_proxy: bool):
         try:
             web3 = await self.get_web3_with_check(address, use_proxy)
-            
+
             amount_to_wei = web3.to_wei(self.tx_amount, "ether")
             max_priority_fee = web3.to_wei(1, "gwei")
             max_fee = max_priority_fee
@@ -391,19 +412,20 @@ class PharosTestnet:
                 "maxFeePerGas": int(max_fee),
                 "maxPriorityFeePerGas": int(max_priority_fee),
                 "nonce": self.used_nonce[address],
-                "chainId": web3.eth.chain_id
+                "chainId": web3.eth.chain_id,
             }
 
             tx_hash = await self.send_raw_transaction_with_retries(account, web3, tx)
             receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
             block_number = receipt.blockNumber
             self.used_nonce[address] += 1
 
             return tx_hash, block_number
         except Exception as e:
             self.log(
-                f"{Fore.CYAN+Style.BRIGHT}     Message :{Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+                f"{Fore.CYAN + Style.BRIGHT}     Message :{Style.RESET_ALL}"
+                f"{Fore.RED + Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
             )
             return None, None
         
@@ -433,6 +455,7 @@ class PharosTestnet:
 
             tx_hash = await self.send_raw_transaction_with_retries(account, web3, wrap_tx)
             receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
             block_number = receipt.blockNumber
             self.used_nonce[address] += 1
 
@@ -469,6 +492,7 @@ class PharosTestnet:
 
             tx_hash = await self.send_raw_transaction_with_retries(account, web3, unwrap_tx)
             receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
             block_number = receipt.blockNumber
             self.used_nonce[address] += 1
 
@@ -509,6 +533,7 @@ class PharosTestnet:
 
                 tx_hash = await self.send_raw_transaction_with_retries(account, web3, approve_tx)
                 receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
                 block_number = receipt.blockNumber
                 self.used_nonce[address] += 1
                 
@@ -592,6 +617,7 @@ class PharosTestnet:
 
             tx_hash = await self.send_raw_transaction_with_retries(account, web3, swap_tx)
             receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
             block_number = receipt.blockNumber
             self.used_nonce[address] += 1
 
@@ -656,6 +682,7 @@ class PharosTestnet:
 
             tx_hash = await self.send_raw_transaction_with_retries(account, web3, lp_tx)
             receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+
             block_number = receipt.blockNumber
             self.used_nonce[address] += 1
 
@@ -1053,7 +1080,23 @@ class PharosTestnet:
 
         return option, choose, rotate
     
-    async def user_login(self, account: str, address: str, proxy=None, retries=5):
+    async def check_connection(self, proxy_url=None):
+        connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+        try:
+            async with ClientSession(connector=connector, timeout=ClientTimeout(total=10)) as session:
+                async with session.get(url="https://api.ipify.org?format=json", proxy=proxy, proxy_auth=proxy_auth) as response:
+                    response.raise_for_status()
+                    return True
+        except (Exception, ClientResponseError) as e:
+            self.log(
+                f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT} Connection Not 200 OK {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {str(e)} {Style.RESET_ALL}"
+            )
+            return None
+    
+    async def user_login(self, account: str, address: str, proxy_url=None, retries=5):
         url = f"{self.BASE_API}/user/login"
         data = json.dumps(self.generate_payload(account, address))
         headers = {
@@ -1064,10 +1107,10 @@ class PharosTestnet:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            connector = ProxyConnector.from_url(proxy) if proxy else None
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.post(url=url, headers=headers, data=data) as response:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         return await response.json()
             except (Exception, ClientResponseError) as e:
@@ -1081,7 +1124,7 @@ class PharosTestnet:
 
         return None
     
-    async def user_profile(self, address: str, proxy=None, retries=5):
+    async def user_profile(self, address: str, proxy_url=None, retries=5):
         url = f"{self.BASE_API}/user/profile?address={address}"
         headers = {
             **self.headers,
@@ -1089,10 +1132,10 @@ class PharosTestnet:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            connector = ProxyConnector.from_url(proxy) if proxy else None
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.get(url=url, headers=headers) as response:
+                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         result = await response.json()
                         if "code" in result and result["code"] != 0:
@@ -1106,7 +1149,7 @@ class PharosTestnet:
 
         return None
     
-    async def sign_in(self, address: str, proxy=None, retries=10):
+    async def sign_in(self, address: str, proxy_url=None, retries=10):
         url = f"{self.BASE_API}/sign/in"
         data = json.dumps({"address":address})
         headers = {
@@ -1117,10 +1160,10 @@ class PharosTestnet:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            connector = ProxyConnector.from_url(proxy) if proxy else None
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.post(url=url, headers=headers, data=data) as response:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         result = await response.json()
                         if "code" in result and result["code"] not in [0, 1]:
@@ -1134,7 +1177,7 @@ class PharosTestnet:
 
             return None
     
-    async def faucet_status(self, address: str, proxy=None, retries=10):
+    async def faucet_status(self, address: str, proxy_url=None, retries=10):
         url = f"{self.BASE_API}/faucet/status?address={address}"
         headers = {
             **self.headers,
@@ -1142,10 +1185,10 @@ class PharosTestnet:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            connector = ProxyConnector.from_url(proxy) if proxy else None
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.get(url=url, headers=headers) as response:
+                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         result = await response.json()
                         if "code" in result and result["code"] != 0:
@@ -1159,7 +1202,7 @@ class PharosTestnet:
 
             return None
             
-    async def claim_faucet(self, address: str, proxy=None, retries=5):
+    async def claim_faucet(self, address: str, proxy_url=None, retries=5):
         url = f"{self.BASE_API}/faucet/daily"
         data = json.dumps({"address":address})
         headers = {
@@ -1170,10 +1213,10 @@ class PharosTestnet:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            connector = ProxyConnector.from_url(proxy) if proxy else None
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.post(url=url, headers=headers, data=data) as response:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         result = await response.json()
                         if "code" in result and result["code"] not in [0, 1]:
@@ -1198,10 +1241,10 @@ class PharosTestnet:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            connector = ProxyConnector.from_url(proxy) if proxy else None
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=120)) as session:
-                    async with session.post(url=url, headers=headers, data=data) as response:
+                    async with session.post(url=url, headers=headers, data=data, ssl=False) as response:
                         response.raise_for_status()
                         result = await response.json()
                         if "code" in result and result["code"] != 0:
@@ -1219,7 +1262,7 @@ class PharosTestnet:
 
             return None
             
-    async def process_user_login(self, account: str, address: str, use_proxy: bool, rotate_proxy: bool):
+    async def process_check_connection(self, address: str, use_proxy: bool, rotate_proxy: bool):
         while True:
             proxy = self.get_next_proxy_for_account(address) if use_proxy else None
             self.log(
@@ -1227,7 +1270,29 @@ class PharosTestnet:
                 f"{Fore.WHITE+Style.BRIGHT} {proxy} {Style.RESET_ALL}"
             )
 
+            is_valid = await self.check_connection(proxy)
+            if not is_valid:
+                if rotate_proxy:
+                    proxy = self.rotate_proxy_for_account(address)
+                    continue
+
+                return False
+            
+            return True
+
+    async def process_user_login(self, account: str, address: str, use_proxy: bool, rotate_proxy: bool):
+        is_valid = await self.process_check_connection(address, use_proxy, rotate_proxy)
+        if is_valid:
+            proxy = self.get_next_proxy_for_account(address) if use_proxy else None
+
             web3 = await self.get_web3_with_check(address, use_proxy)
+            if not web3:
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT} Web3 Not Connected {Style.RESET_ALL}"
+                )
+                return False
+            
             self.used_nonce[address] = web3.eth.get_transaction_count(address, "pending")
 
             login = await self.user_login(account, address, proxy)
@@ -1239,16 +1304,6 @@ class PharosTestnet:
                     f"{Fore.GREEN+Style.BRIGHT} Login Success {Style.RESET_ALL}"
                 )
                 return True
-
-            if rotate_proxy:
-                self.log(
-                    f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT} Login Failed, {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT} Rotating Proxy... {Style.RESET_ALL}"
-                )
-                proxy = self.rotate_proxy_for_account(address)
-                await asyncio.sleep(5)
-                continue
 
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"

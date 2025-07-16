@@ -1,2 +1,1 @@
-your_private_key_1
-your_private_key_2
+0x700cf5e3d761d354b7d848b7281da4bc5562049f299d0a3359c39a35109536c5

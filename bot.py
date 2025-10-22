@@ -829,7 +829,7 @@ class PharosTestnet:
                 f"{Fore.WHITE+Style.BRIGHT} {balance} PHRS {Style.RESET_ALL}"
             )
 
-            if not balance:
+            if balance is None:
                 self.log(
                     f"{Fore.CYAN+Style.BRIGHT}   Status   :{Style.RESET_ALL}"
                     f"{Fore.YELLOW+Style.BRIGHT} Fetch PHRS Token Balance Failed {Style.RESET_ALL}"
